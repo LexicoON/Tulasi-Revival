@@ -1,4 +1,4 @@
-# Tulasi
+# Tulasi - Revival
 ### a pixel art icon pack for Linux. designed by an artist.
 
 <img width="5643" height="1620" alt="COver" src="https://github.com/user-attachments/assets/9b0b648a-951a-4963-ba4e-804184629b2c" />
