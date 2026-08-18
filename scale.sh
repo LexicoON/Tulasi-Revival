@@ -1,12 +1,21 @@
 #!/bin/bash
+# Tulasi build script
+# Generates PNG icons at 8 sizes from the SVG masters in cow/
+# and creates hard-copy aliases for all the app-name mappings.
+#
+# Usage: bash scale.sh
+# Output: 16x16/apps, 24x24/apps, ..., 512x512/apps + a fresh index.theme
+#
+# Requirements: librsvg2-bin (rsvg-convert), imagemagick (magick or convert)
 
-# Root directory of your icon theme
-THEME_DIR="/home/nuclear/Documents/Arpana"
+set -e
+
+# Resolve theme dir to wherever this script lives — works from any path
+THEME_DIR="$(cd "$(dirname "$0")" && pwd)"
 COW_DIR="$THEME_DIR/cow"
 
 cd "$THEME_DIR" || exit 1
 
-# List of target size directories
 SIZES=("16x16" "24x24" "32x32" "48x48" "64x64" "128x128" "256x256" "512x512")
 
 echo "=== 1. Ensuring clean target folders ==="
@@ -22,7 +31,7 @@ if [ ! -d "$COW_DIR" ]; then
 fi
 
 if ! command -v rsvg-convert &> /dev/null; then
-    echo "Error: rsvg-convert is not installed! Install the 'librsvg' package."
+    echo "Error: rsvg-convert is not installed! Install 'librsvg2-bin' (Debian/Ubuntu) or 'librsvg' (Arch)."
     exit 1
 fi
 
@@ -31,13 +40,15 @@ if command -v magick &> /dev/null; then
 elif command -v convert &> /dev/null; then
     IMG_CMD="convert"
 else
-    echo "Error: ImageMagick is not installed!"
+    echo "Error: ImageMagick is not installed! Install 'imagemagick'."
     exit 1
 fi
 
 echo "=== 2. Crash-Free Hybrid PNG Generation ==="
+master_count=0
 for master in "$COW_DIR"/*.svg; do
-    [ -f "$master" ] && [ ! -L "$master" ] || continue
+    [ -f "$master" ] || continue
+    [ ! -L "$master" ] || continue
 
     base_name=$(basename "$master" .svg)
     png_filename="${base_name}.png"
@@ -45,15 +56,12 @@ for master in "$COW_DIR"/*.svg; do
 
     echo "  -> Processing: $base_name"
 
-    # Step A: Safely render a 512px master using rsvg (bypasses Inkscape crash)
     rsvg-convert -w 512 -h 512 "$master" -o "$tmp_master"
 
-    # Step B: Use your preferred -scale logic to snap the pixels to smaller grids
     for size in "${SIZES[@]}"; do
         target_file="$size/apps/$png_filename"
         dim=$(echo "$size" | cut -d'x' -f1)
 
-        # If it's 512, just copy the temp file. Otherwise, scale it sharply.
         if [ "$dim" -eq 512 ]; then
             cp "$tmp_master" "$target_file"
         else
@@ -61,11 +69,12 @@ for master in "$COW_DIR"/*.svg; do
         fi
     done
 
-    # Clean up the temporary file
     rm -f "$tmp_master"
+    master_count=$((master_count + 1))
 done
+echo "=== Processed $master_count source SVGs ==="
 
-echo "=== 3. Generating Link Shortcuts ==="
+echo "=== 3. Generating Aliases (as real file copies) ==="
 MAPS=(
 "mother-affinity.png:affinity.png:Affinity.png:affinity-photo.png:affinity-designer.png:affinity-publisher.png:appimagekit-affinity-photo.png:appimagekit-affinity-designer.png:appimagekit-affinity-publisher.png:appimagekit-affinity.png:Affinity-photo.png:Affinity-designer.png:Affinity-publisher.png"
 "mother-akregator.png:org.kde.akregator.png:akregator.png:Akregator.png"
@@ -187,6 +196,7 @@ MAPS=(
 "mother-zededitor.png:zed.png:dev.zed.Zed.png:Zed.png"
 "mother-zenbrowser.png:zen.png:zen-browser.png:io.github.zen_browser.zen.png:Zen.png:appimagekit-zen-browser.png:zen-alpha.png:app.zen_browser.zen.png"
 )
+
 for entry in "${MAPS[@]}"; do
     IFS=":" read -r -a aliases <<< "$entry"
     master_file="${aliases[0]}"
@@ -198,14 +208,130 @@ for entry in "${MAPS[@]}"; do
             for ((i=1; i<${#aliases[@]}; i++)); do
                 alias_name="${aliases[i]}"
                 alias_clean="${alias_name//.svg/.png}"
-                ln -sf "$master_file" "$apps_dir/$alias_clean"
+                # HARD COPY instead of symlink — symlinks break in some tools
+                # and on some filesystems when packaged as a zip.
+                cp -f "$apps_dir/$master_file" "$apps_dir/$alias_clean"
             done
-        else
-            echo "  !! Missing master for symlinks: $apps_dir/$master_file"
         fi
     done
 done
 
-echo "=== 4. Cleaning system caches ==="
-gtk-update-icon-cache -f -t ~/.local/share/icons/Arpana 2>/dev/null || true
-rm -f ~/.cache/icon-cache.kcache
+echo "=== 4. Building index.theme ==="
+SCALABLE_DIRS=""
+if [ -d "$THEME_DIR/scalable" ]; then
+    for sub in actions places status devices mimetypes categories symbolic; do
+        if [ -d "$THEME_DIR/scalable/$sub" ]; then
+            SCALABLE_DIRS="$SCALABLE_DIRS,scalable/$sub"
+        fi
+    done
+fi
+
+cat > "$THEME_DIR/index.theme" <<THEME_EOF
+[Icon Theme]
+Name=Tulasi
+Comment=Tulasi pixel-art icon theme for Linux
+Inherits=papirus,hicolor,breeze,breeze-dark,Adwaita
+FollowsColorScheme=true
+Directories=16x16/apps,24x24/apps,32x32/apps,48x48/apps,64x64/apps,128x128/apps,256x256/apps,512x512/apps${SCALABLE_DIRS}
+
+[16x16/apps]
+Size=16
+Type=Fixed
+Context=Applications
+
+[24x24/apps]
+Size=24
+Type=Fixed
+Context=Applications
+
+[32x32/apps]
+Size=32
+Type=Fixed
+Context=Applications
+
+[48x48/apps]
+Size=48
+Type=Fixed
+Context=Applications
+
+[64x64/apps]
+Size=64
+Type=Fixed
+Context=Applications
+
+[128x128/apps]
+Size=128
+Type=Fixed
+Context=Applications
+
+[256x256/apps]
+Size=256
+Type=Fixed
+Context=Applications
+
+[512x512/apps]
+Size=512
+Type=Fixed
+Context=Applications
+
+[scalable/actions]
+Size=22
+MinSize=16
+MaxSize=512
+Type=Scalable
+Context=Actions
+
+[scalable/places]
+Size=22
+MinSize=22
+MaxSize=1024
+Type=Scalable
+Context=Places
+
+[scalable/status]
+Size=22
+MinSize=16
+MaxSize=512
+Type=Scalable
+Context=Status
+
+[scalable/devices]
+Size=22
+MinSize=16
+MaxSize=512
+Type=Scalable
+Context=Devices
+
+[scalable/mimetypes]
+Size=22
+MinSize=16
+MaxSize=512
+Type=Scalable
+Context=MimeTypes
+
+[scalable/categories]
+Size=22
+MinSize=16
+MaxSize=512
+Type=Scalable
+Context=Categories
+
+[scalable/symbolic]
+Size=16
+MinSize=16
+MaxSize=31
+Type=Scalable
+Context=Actions
+THEME_EOF
+
+echo "=== 5. Final cleanup ==="
+rm -f "$THEME_DIR/awd"
+rm -f "$THEME_DIR/icon-theme.cache"
+
+# Generate icon cache so installs feel snappy
+if command -v gtk-update-icon-cache &> /dev/null; then
+    gtk-update-icon-cache -f -t "$THEME_DIR" 2>/dev/null || true
+fi
+
+echo "=== Build complete ==="
+echo "Install: cp -r '$THEME_DIR' ~/.local/share/icons/Tulasi"
