@@ -4,6 +4,20 @@
 <img width="5643" height="1620" alt="COver" src="https://github.com/user-attachments/assets/9b0b648a-951a-4963-ba4e-804184629b2c" />
 
 
+> **note about this fork**
+>
+> I'm a user of Tulasi, not the creator. all the design, all the pixel art, all the credit for this icon pack belongs to [Shringar Studio](https://github.com/shringarstudio) — please support their original work if you can.
+>
+> I don't know what happened to the creator, and I'm not here to replace Tulasi, rebrand it, or add new icons. the artwork is theirs and stays theirs.
+>
+> what I *am* doing is small maintenance work on the side — fixing packaging issues, improving the build so the theme installs cleanly, unifying it with icon packs users already have (like Papirus) so nothing renders as a blank box. the kind of boring code-side stuff the creator mentioned wanting help with in their own README.
+>
+> I made this fork for myself because I love using Tulasi and wanted it to keep working. I'm sharing it in case it's useful to anyone else in the same spot. if Shringar Studio comes back and wants the repo, no hard feelings — everything here is theirs under the same CC BY-NC-SA 4.0 license.
+>
+> — *a fellow Linux user* <3
+
+---
+
 every icon in Tulasi is pixel art. 32x32. uniform shape. consistent visual grammar.
 
 but it's not just aesthetic — each icon is designed to actually communicate something about the app it represents. if an app is good, it deserves an icon that says so.
@@ -88,7 +102,7 @@ go to **System Settings → Appearance → Icons → Install from File** and sel
 
 ## app coverage
 
-any app not listed here will fall back to your system theme (Adwaita on GNOME, Breeze on KDE).
+any app not listed here will fall back to your system theme (Adwaita on GNOME, Breeze on KDE). if you have [Papirus](https://github.com/PapirusDevelopmentTeam/papirus-icon-theme) installed, this fork's builds will fall back to that first, since it covers a much larger set of apps out of the box.
 
 **browsers** — Firefox (native + Flatpak), Brave, Vivaldi, Zen Browser, LibreWolf
 
@@ -149,7 +163,7 @@ missing an icon for your favourite app? open an issue or submit a PR! include:
 - the icon name (run `grep "^Icon=" /path/to/app.desktop`)
 - a reference image of the original icon
 -  **Expanding Coverage:** New icons are added regularly.
--  **Rices:** I’m planning to release full desktop configurations to match the Tulasi aesthetic soon
+-  **Rices:** I'm planning to release full desktop configurations to match the Tulasi aesthetic soon
 I am a **UI/UX and branding designer**, not a developer. While I handle the art and visual grammar, **I need your help with the code!** If you know how to improve packaging, scripts, or system integration, please jump in.
 
 ---
