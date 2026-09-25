@@ -1,17 +1,9 @@
 name: Build Tulasi
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'cow/**'
-      - 'scalable/**'
-      - 'index.theme'
-      - 'scale.sh'
-      - '.github/workflows/**'
   workflow_dispatch:
-  pull_request:
-    branches: [ main ]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -25,7 +17,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          # Fetch full git history so we can compute version from tags
           fetch-depth: 0
 
       - name: Install build dependencies
@@ -44,8 +35,6 @@ jobs:
           mkdir -p build
 
       - name: Generate build script
-        # We regenerate scale.sh in the build dir instead of patching the original
-        # so the source repo stays clean and the script works from any path
         run: |
           cat > build/scale.sh <<'SCALE_EOF'
           #!/bin/bash
@@ -56,14 +45,17 @@ jobs:
 
           cd "$THEME_DIR" || exit 1
 
-          SIZES=("16x16" "24x24" "32x32" "48x48" "64x64" "128x128" "256x256" "512x512")
-
-          echo "=== 1. Ensuring clean target folders ==="
-          for size in "${SIZES[@]}"; do
-              rm -rf "$size/apps"
-              mkdir -p "$size/apps"
-          done
-          mkdir -p "places/symbolic"
+          # --- Density list ---
+          if [ -s "$THEME_DIR/.base_sizes" ]; then
+              SIZES=()
+              while IFS= read -r line; do
+                  [ -n "$line" ] && SIZES+=("$line")
+              done < "$THEME_DIR/.base_sizes"
+              echo "Using densities from base: ${SIZES[*]}"
+          else
+              SIZES=("16x16" "22x22" "24x24" "32x32" "48x48" "64x64" "96x96" "128x128" "256x256" "512x512")
+              echo "Using default densities: ${SIZES[*]}"
+          fi
 
           if [ ! -d "$COW_DIR" ]; then
               echo "Error: Directory '$COW_DIR' not found!"
@@ -71,7 +63,7 @@ jobs:
           fi
 
           if ! command -v rsvg-convert &> /dev/null; then
-              echo "Error: rsvg-convert is not installed! Install the 'librsvg2-bin' package."
+              echo "Error: rsvg-convert is not installed! Install 'librsvg2-bin'."
               exit 1
           fi
 
@@ -84,26 +76,55 @@ jobs:
               exit 1
           fi
 
-          echo "=== 2. Crash-Free Hybrid PNG Generation ==="
+          # Figure out pixel dimension from a density string.
+          # "48x48" -> 48 | "48x48@2x" -> 96 | "8x8" -> 8
+          target_dim() {
+              local s="$1"
+              local n
+              n=$(echo "$s" | sed -E 's/^([0-9]+).*/\1/')
+              if [[ "$s" == *"@2x"* ]]; then
+                  echo $((n * 2))
+              else
+                  echo "$n"
+              fi
+          }
+
+          # Decide context: folders/home icons belong to places/, everything else to apps/
+          detect_ctx() {
+              case "$1" in
+                  folder*|user-*|inode-directory*|mother-folder*|mother-user-*|mother-place*|mother-home*)
+                      echo "places" ;;
+                  *)
+                      echo "apps" ;;
+              esac
+          }
+
+          echo "=== 1. Ensuring clean target folders ==="
+          for size in "${SIZES[@]}"; do
+              rm -rf "$size/apps" "$size/places"
+              mkdir -p "$size/apps" "$size/places"
+          done
+
+          echo "=== 2. Rendering cow/ SVGs at every density ==="
           master_count=0
           for master in "$COW_DIR"/*.svg; do
               [ -f "$master" ] || continue
-              # Skip non-regular files (defensive)
               [ ! -L "$master" ] || continue
 
               base_name=$(basename "$master" .svg)
               png_filename="${base_name}.png"
               tmp_master="/tmp/${base_name}_temp.png"
 
-              echo "  -> Processing: $base_name"
+              ctx=$(detect_ctx "$base_name")
+              echo "  -> $base_name  [$ctx]"
 
-              # Step A: Safely render a 512px master using rsvg
               rsvg-convert -w 512 -h 512 "$master" -o "$tmp_master"
 
-              # Step B: Snap to smaller grids with ImageMagick
               for size in "${SIZES[@]}"; do
-                  target_file="$size/apps/$png_filename"
-                  dim=$(echo "$size" | cut -d'x' -f1)
+                  dim=$(target_dim "$size")
+                  target_dir="$size/$ctx"
+                  target_file="$target_dir/$png_filename"
+                  mkdir -p "$target_dir"
 
                   if [ "$dim" -eq 512 ]; then
                       cp "$tmp_master" "$target_file"
@@ -115,10 +136,9 @@ jobs:
               rm -f "$tmp_master"
               master_count=$((master_count + 1))
           done
-
           echo "=== Processed $master_count source SVGs ==="
 
-          echo "=== 3. Generating Link Shortcuts (as real file copies) ==="
+          echo "=== 3. App aliases ==="
           MAPS=(
           "mother-affinity.png:affinity.png:Affinity.png:affinity-photo.png:affinity-designer.png:affinity-publisher.png:appimagekit-affinity-photo.png:appimagekit-affinity-designer.png:appimagekit-affinity-publisher.png:appimagekit-affinity.png:Affinity-photo.png:Affinity-designer.png:Affinity-publisher.png"
           "mother-akregator.png:org.kde.akregator.png:akregator.png:Akregator.png"
@@ -244,137 +264,149 @@ jobs:
           for entry in "${MAPS[@]}"; do
               IFS=":" read -r -a aliases <<< "$entry"
               master_file="${aliases[0]}"
-
               for size in "${SIZES[@]}"; do
                   apps_dir="$THEME_DIR/$size/apps"
-
+                  [ -d "$apps_dir" ] || continue
                   if [ -f "$apps_dir/$master_file" ]; then
                       for ((i=1; i<${#aliases[@]}; i++)); do
                           alias_name="${aliases[i]}"
                           alias_clean="${alias_name//.svg/.png}"
-                          # Use a HARD COPY instead of a symlink.
-                          # Symlinks break in some browsers, file managers,
-                          # and KDE/Plasma lookups when the theme is packaged
-                          # as a zip or installed across filesystems.
+                          [ "$alias_clean" = "$master_file" ] && continue
                           cp -f "$apps_dir/$master_file" "$apps_dir/$alias_clean"
                       done
-                  else
-                      echo "  !! Missing master for aliases: $apps_dir/$master_file"
                   fi
               done
           done
 
-          echo "=== 4. Building the index.theme ==="
-          SCALABLE_DIRS=""
+          echo "=== 3b. Place (folder) aliases ==="
+          PLACE_MAPS=(
+          "folder.png:folder-open.png:inode-directory.png"
+          "folder-download.png:folder-downloads.png"
+          "user-home.png:user-desktop.png"
+          "user-trash.png:user-trash-full.png:trash-empty.png:trash-full.png"
+          )
+
+          for entry in "${PLACE_MAPS[@]}"; do
+              IFS=":" read -r -a aliases <<< "$entry"
+              canonical="${aliases[0]}"
+              for size in "${SIZES[@]}"; do
+                  places_dir="$THEME_DIR/$size/places"
+                  [ -d "$places_dir" ] || continue
+                  master_file=""
+                  if [ -f "$places_dir/$canonical" ]; then
+                      master_file="$canonical"
+                  elif [ -f "$places_dir/mother-${canonical}" ]; then
+                      master_file="mother-${canonical}"
+                  fi
+                  [ -n "$master_file" ] || continue
+                  for ((i=1; i<${#aliases[@]}; i++)); do
+                      alias_name="${aliases[i]}"
+                      alias_clean="${alias_name//.svg/.png}"
+                      [ "$alias_clean" = "$master_file" ] && continue
+                      cp -f "$places_dir/$master_file" "$places_dir/$alias_clean"
+                  done
+              done
+          done
+
+          echo "=== 4. Rendering scalable/* SVGs to PNGs ==="
+          if [ -d "$THEME_DIR/scalable" ]; then
+              for ctx_dir in "$THEME_DIR"/scalable/*/; do
+                  [ -d "$ctx_dir" ] || continue
+                  ctx=$(basename "$ctx_dir")
+                  if [ "$ctx" = "symbolic" ]; then
+                      continue
+                  fi
+                  for svg in "$ctx_dir"*.svg; do
+                      [ -f "$svg" ] || continue
+                      base_name=$(basename "$svg" .svg)
+                      tmp_master="/tmp/scalable_${ctx}_${base_name}.png"
+                      rsvg-convert -w 512 -h 512 "$svg" -o "$tmp_master"
+                      for size in "${SIZES[@]}"; do
+                          dim=$(target_dim "$size")
+                          target_dir="$size/$ctx"
+                          target_file="$target_dir/$base_name.png"
+                          mkdir -p "$target_dir"
+                          if [ "$dim" -eq 512 ]; then
+                              cp "$tmp_master" "$target_file"
+                          else
+                              $IMG_CMD -background none "$tmp_master" -scale "${dim}x${dim}!" "$target_file"
+                          fi
+                      done
+                      rm -f "$tmp_master"
+                  done
+              done
+          fi
+
+          echo "=== 5. Building index.theme ==="
+          ALL_DIRS=""
+          for size in "${SIZES[@]}"; do
+              for ctx in apps places actions devices mimetypes status categories; do
+                  if [ -d "$THEME_DIR/$size/$ctx" ]; then
+                      ALL_DIRS="$ALL_DIRS,$size/$ctx"
+                  fi
+              done
+          done
           if [ -d "$THEME_DIR/scalable" ]; then
               for sub in actions places status devices mimetypes categories symbolic; do
                   if [ -d "$THEME_DIR/scalable/$sub" ]; then
-                      SCALABLE_DIRS="$SCALABLE_DIRS,scalable/$sub"
+                      ALL_DIRS="$ALL_DIRS,scalable/$sub"
                   fi
               done
           fi
+          ALL_DIRS="${ALL_DIRS#,}"
 
           cat > "$THEME_DIR/index.theme" <<THEME_EOF
           [Icon Theme]
           Name=Tulasi
           Comment=Tulasi pixel-art icon theme for Linux
-          Inherits=papirus,hicolor,breeze,breeze-dark,Adwaita
+          Inherits=hicolor,Adwaita
           FollowsColorScheme=true
-          Directories=16x16/apps,24x24/apps,32x32/apps,48x48/apps,64x64/apps,128x128/apps,256x256/apps,512x512/apps${SCALABLE_DIRS}
 
-          [16x16/apps]
-          Size=16
-          Type=Fixed
-          Context=Applications
-
-          [24x24/apps]
-          Size=24
-          Type=Fixed
-          Context=Applications
-
-          [32x32/apps]
-          Size=32
-          Type=Fixed
-          Context=Applications
-
-          [48x48/apps]
-          Size=48
-          Type=Fixed
-          Context=Applications
-
-          [64x64/apps]
-          Size=64
-          Type=Fixed
-          Context=Applications
-
-          [128x128/apps]
-          Size=128
-          Type=Fixed
-          Context=Applications
-
-          [256x256/apps]
-          Size=256
-          Type=Fixed
-          Context=Applications
-
-          [512x512/apps]
-          Size=512
-          Type=Fixed
-          Context=Applications
-
-          [scalable/actions]
-          Size=22
-          MinSize=16
-          MaxSize=512
-          Type=Scalable
-          Context=Actions
-
-          [scalable/places]
-          Size=22
-          MinSize=22
-          MaxSize=1024
-          Type=Scalable
-          Context=Places
-
-          [scalable/status]
-          Size=22
-          MinSize=16
-          MaxSize=512
-          Type=Scalable
-          Context=Status
-
-          [scalable/devices]
-          Size=22
-          MinSize=16
-          MaxSize=512
-          Type=Scalable
-          Context=Devices
-
-          [scalable/mimetypes]
-          Size=22
-          MinSize=16
-          MaxSize=512
-          Type=Scalable
-          Context=MimeTypes
-
-          [scalable/categories]
-          Size=22
-          MinSize=16
-          MaxSize=512
-          Type=Scalable
-          Context=Categories
-
-          [scalable/symbolic]
-          Size=16
-          MinSize=16
-          MaxSize=31
-          Type=Scalable
-          Context=Actions
+          Directories=${ALL_DIRS}
           THEME_EOF
 
-          echo "=== 5. Cleaning ==="
-          rm -f "$THEME_DIR/awd"  # The empty file in the source repo (probably accidental)
+          for dir in $(echo "$ALL_DIRS" | tr ',' ' '); do
+              size_part=$(echo "$dir" | cut -d'/' -f1)
+              ctx_part=$(echo "$dir" | cut -d'/' -f2)
+              if [[ "$size_part" == "scalable" ]]; then
+                  cat >> "$THEME_DIR/index.theme" <<SECTION
+
+          [$dir]
+          Size=256
+          MinSize=16
+          MaxSize=512
+          Type=Scalable
+          Context=${ctx_part^}
+          SECTION
+              elif [[ "$size_part" == *"@"* ]]; then
+                  nominal=$(echo "$size_part" | sed -E 's/([0-9]+)x[0-9]+@.*/\1/')
+                  scale=$(echo "$size_part" | sed -E 's/.*@([0-9]+)x?/\1/')
+                  cat >> "$THEME_DIR/index.theme" <<SECTION
+
+          [$dir]
+          Size=${nominal}
+          Scale=${scale}
+          Type=Scalable
+          MinSize=${nominal}
+          MaxSize=$((nominal * 4))
+          Context=${ctx_part^}
+          SECTION
+              else
+                  nominal=$(echo "$size_part" | sed -E 's/([0-9]+)x.*/\1/')
+                  cat >> "$THEME_DIR/index.theme" <<SECTION
+
+          [$dir]
+          Size=${nominal}
+          Type=Fixed
+          Context=${ctx_part^}
+          SECTION
+              fi
+          done
+
+          echo "=== 6. Cleaning ==="
+          rm -f "$THEME_DIR/awd"
           rm -f "$THEME_DIR/icon-theme.cache"
+          rm -f "$THEME_DIR/.base_sizes"
 
           echo "=== Build complete ==="
           SCALE_EOF
@@ -382,8 +414,6 @@ jobs:
 
       - name: Copy source assets into build dir
         run: |
-          # Copy cow/ and scalable/ (if it exists) into build/
-          # The script writes index.theme itself, so we don't copy the old one
           cp -r cow build/cow
           if [ -d scalable ]; then
             cp -r scalable build/scalable
@@ -394,15 +424,9 @@ jobs:
           cd build
           bash scale.sh
           echo ""
-          echo "=== Verification: count PNGs in each size folder ==="
-          for s in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
-            count=$(find "$s/apps" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
-            echo "$s/apps: $count real PNG files"
-          done
-          echo ""
-          echo "=== Sample PNG (firefox) - check it's a real PNG not a symlink ==="
-          ls -la 128x128/apps/firefox.png 128x128/apps/mother-firefox.png 2>&1 | head -5
-          file 128x128/apps/firefox.png 2>&1 | head -2
+          echo "=== Verification: 48x48/apps sample ==="
+          ls 48x48/apps/ 2>/dev/null | head -5
+          echo "... total: $(ls 48x48/apps/ 2>/dev/null | wc -l)"
 
       - name: Get version tag
         id: version
@@ -417,10 +441,7 @@ jobs:
       - name: Package theme
         run: |
           cd build
-          # Remove the cow/ source folder from the packaged theme
-          rm -rf cow scale.sh
-          # The folder name is "build" right now (because that's our THEME_DIR)
-          # Rename to Tulasi for the user-facing zip
+          rm -rf cow scale.sh .base_sizes
           cd ..
           mv build Tulasi
           zip -r "Tulasi-${{ steps.version.outputs.version }}.zip" Tulasi
@@ -445,8 +466,7 @@ jobs:
       - name: Resolve version from tag
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
