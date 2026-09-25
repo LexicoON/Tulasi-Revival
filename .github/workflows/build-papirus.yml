@@ -1,17 +1,9 @@
 name: Build Tulasi+Papirus
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'cow/**'
-      - 'scalable/**'
-      - 'index.theme'
-      - 'merge.sh'
-      - '.github/workflows/**'
   workflow_dispatch:
-  pull_request:
-    branches: [ main ]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -32,40 +24,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y librsvg2-bin imagemagick rsync
 
-      - name: Show tool versions
-        run: |
-          rsvg-convert --version
-          convert --version | head -1
-          rsync --version | head -1
-
       - name: Resolve latest Papirus version
         id: papirus
         run: |
-          # Query the GitHub API to get the latest Papirus release tag
-          # Falls back to a known good version if the API is rate-limited
           TAG=$(curl -sf \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/PapirusDevelopmentTeam/papirus-icon-theme/releases/latest" \
             | grep -oE '"tag_name":\s*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-
           if [ -z "$TAG" ]; then
-            echo "::warning::Could not resolve latest Papirus tag from API, falling back to 20260801"
+            echo "::warning::Could not resolve latest Papirus tag, falling back to 20260801"
             TAG="20260801"
           fi
-
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "Resolved Papirus version: ${TAG}"
 
       - name: Download latest Papirus source
         run: |
-          mkdir -p papirus-src
-          # Use the auto-generated source tarball from the tag.
-          # This is always available, even when no release assets are uploaded.
-          curl -fL \
-            -o papirus.tar.gz \
+          curl -fL -o papirus.tar.gz \
             "https://github.com/PapirusDevelopmentTeam/papirus-icon-theme/archive/refs/tags/${{ steps.papirus.outputs.tag }}.tar.gz"
-
           echo "Downloaded $(du -h papirus.tar.gz | cut -f1)"
 
       - name: Extract Papirus
@@ -79,9 +56,13 @@ jobs:
           rm -rf build
           mkdir -p build
 
+      - name: Discover Papirus densities
+        run: |
+          ls papirus/Papirus/ 2>/dev/null | grep -E '^[0-9]+x[0-9]+(@[0-9]+x?)?$' > build/.base_sizes || true
+          echo "Discovered densities:"
+          cat build/.base_sizes
+
       - name: Generate build script
-        # We regenerate the build script in the build dir so the source
-        # repo stays clean and the script works from any path
         run: |
           cat > build/scale.sh <<'SCALE_EOF'
           #!/bin/bash
@@ -92,25 +73,26 @@ jobs:
 
           cd "$THEME_DIR" || exit 1
 
-          SIZES=("16x16" "24x24" "32x32" "48x48" "64x64" "128x128" "256x256" "512x512")
-
-          echo "=== 1. Ensuring clean target folders ==="
-          for size in "${SIZES[@]}"; do
-              rm -rf "$size/apps"
-              mkdir -p "$size/apps"
-          done
-          mkdir -p "places/symbolic"
+          # --- Density list ---
+          if [ -s "$THEME_DIR/.base_sizes" ]; then
+              SIZES=()
+              while IFS= read -r line; do
+                  [ -n "$line" ] && SIZES+=("$line")
+              done < "$THEME_DIR/.base_sizes"
+              echo "Using densities from base: ${SIZES[*]}"
+          else
+              SIZES=("16x16" "22x22" "24x24" "32x32" "48x48" "64x64" "96x96" "128x128" "256x256" "512x512")
+              echo "Using default densities: ${SIZES[*]}"
+          fi
 
           if [ ! -d "$COW_DIR" ]; then
               echo "Error: Directory '$COW_DIR' not found!"
               exit 1
           fi
-
           if ! command -v rsvg-convert &> /dev/null; then
-              echo "Error: rsvg-convert is not installed! Install 'librsvg2-bin'."
+              echo "Error: rsvg-convert is not installed!"
               exit 1
           fi
-
           if command -v magick &> /dev/null; then
               IMG_CMD="magick"
           elif command -v convert &> /dev/null; then
@@ -120,37 +102,56 @@ jobs:
               exit 1
           fi
 
-          echo "=== 2. Crash-Free Hybrid PNG Generation ==="
+          target_dim() {
+              local s="$1"
+              local n
+              n=$(echo "$s" | sed -E 's/^([0-9]+).*/\1/')
+              if [[ "$s" == *"@2x"* ]]; then echo $((n * 2)); else echo "$n"; fi
+          }
+
+          detect_ctx() {
+              case "$1" in
+                  folder*|user-*|inode-directory*|mother-folder*|mother-user-*|mother-place*|mother-home*)
+                      echo "places" ;;
+                  *)
+                      echo "apps" ;;
+              esac
+          }
+
+          echo "=== 1. Ensuring clean target folders ==="
+          for size in "${SIZES[@]}"; do
+              rm -rf "$size/apps" "$size/places"
+              mkdir -p "$size/apps" "$size/places"
+          done
+
+          echo "=== 2. Rendering cow/ SVGs at every density ==="
           master_count=0
           for master in "$COW_DIR"/*.svg; do
               [ -f "$master" ] || continue
               [ ! -L "$master" ] || continue
-
               base_name=$(basename "$master" .svg)
               png_filename="${base_name}.png"
               tmp_master="/tmp/${base_name}_temp.png"
-
-              echo "  -> Processing: $base_name"
-
+              ctx=$(detect_ctx "$base_name")
+              echo "  -> $base_name  [$ctx]"
               rsvg-convert -w 512 -h 512 "$master" -o "$tmp_master"
-
               for size in "${SIZES[@]}"; do
-                  target_file="$size/apps/$png_filename"
-                  dim=$(echo "$size" | cut -d'x' -f1)
-
+                  dim=$(target_dim "$size")
+                  target_dir="$size/$ctx"
+                  target_file="$target_dir/$png_filename"
+                  mkdir -p "$target_dir"
                   if [ "$dim" -eq 512 ]; then
                       cp "$tmp_master" "$target_file"
                   else
                       $IMG_CMD -background none "$tmp_master" -scale "${dim}x${dim}!" "$target_file"
                   fi
               done
-
               rm -f "$tmp_master"
               master_count=$((master_count + 1))
           done
           echo "=== Processed $master_count source SVGs ==="
 
-          echo "=== 3. Generating Aliases (hard copies) ==="
+          echo "=== 3. App aliases ==="
           MAPS=(
           "mother-affinity.png:affinity.png:Affinity.png:affinity-photo.png:affinity-designer.png:affinity-publisher.png:appimagekit-affinity-photo.png:appimagekit-affinity-designer.png:appimagekit-affinity-publisher.png:appimagekit-affinity.png:Affinity-photo.png:Affinity-designer.png:Affinity-publisher.png"
           "mother-akregator.png:org.kde.akregator.png:akregator.png:Akregator.png"
@@ -276,21 +277,80 @@ jobs:
           for entry in "${MAPS[@]}"; do
               IFS=":" read -r -a aliases <<< "$entry"
               master_file="${aliases[0]}"
-
               for size in "${SIZES[@]}"; do
                   apps_dir="$THEME_DIR/$size/apps"
-
+                  [ -d "$apps_dir" ] || continue
                   if [ -f "$apps_dir/$master_file" ]; then
                       for ((i=1; i<${#aliases[@]}; i++)); do
                           alias_name="${aliases[i]}"
                           alias_clean="${alias_name//.svg/.png}"
+                          [ "$alias_clean" = "$master_file" ] && continue
                           cp -f "$apps_dir/$master_file" "$apps_dir/$alias_clean"
                       done
                   fi
               done
           done
 
-          echo "=== 4. Build complete (Tulasi layer only) ==="
+          echo "=== 3b. Place (folder) aliases ==="
+          PLACE_MAPS=(
+          "folder.png:folder-open.png:inode-directory.png"
+          "folder-download.png:folder-downloads.png"
+          "user-home.png:user-desktop.png"
+          "user-trash.png:user-trash-full.png:trash-empty.png:trash-full.png"
+          )
+
+          for entry in "${PLACE_MAPS[@]}"; do
+              IFS=":" read -r -a aliases <<< "$entry"
+              canonical="${aliases[0]}"
+              for size in "${SIZES[@]}"; do
+                  places_dir="$THEME_DIR/$size/places"
+                  [ -d "$places_dir" ] || continue
+                  master_file=""
+                  if [ -f "$places_dir/$canonical" ]; then
+                      master_file="$canonical"
+                  elif [ -f "$places_dir/mother-${canonical}" ]; then
+                      master_file="mother-${canonical}"
+                  fi
+                  [ -n "$master_file" ] || continue
+                  for ((i=1; i<${#aliases[@]}; i++)); do
+                      alias_name="${aliases[i]}"
+                      alias_clean="${alias_name//.svg/.png}"
+                      [ "$alias_clean" = "$master_file" ] && continue
+                      cp -f "$places_dir/$master_file" "$places_dir/$alias_clean"
+                  done
+              done
+          done
+
+          echo "=== 4. Rendering scalable/* SVGs to PNGs ==="
+          if [ -d "$THEME_DIR/scalable" ]; then
+              for ctx_dir in "$THEME_DIR"/scalable/*/; do
+                  [ -d "$ctx_dir" ] || continue
+                  ctx=$(basename "$ctx_dir")
+                  if [ "$ctx" = "symbolic" ]; then
+                      continue
+                  fi
+                  for svg in "$ctx_dir"*.svg; do
+                      [ -f "$svg" ] || continue
+                      base_name=$(basename "$svg" .svg)
+                      tmp_master="/tmp/scalable_${ctx}_${base_name}.png"
+                      rsvg-convert -w 512 -h 512 "$svg" -o "$tmp_master"
+                      for size in "${SIZES[@]}"; do
+                          dim=$(target_dim "$size")
+                          target_dir="$size/$ctx"
+                          target_file="$target_dir/$base_name.png"
+                          mkdir -p "$target_dir"
+                          if [ "$dim" -eq 512 ]; then
+                              cp "$tmp_master" "$target_file"
+                          else
+                              $IMG_CMD -background none "$tmp_master" -scale "${dim}x${dim}!" "$target_file"
+                          fi
+                      done
+                      rm -f "$tmp_master"
+                  done
+              done
+          fi
+
+          echo "=== 5. Build complete (Tulasi layer only) ==="
           SCALE_EOF
           chmod +x build/scale.sh
 
@@ -306,86 +366,51 @@ jobs:
           cd build
           bash scale.sh
           echo ""
-          echo "=== Verification: Tulasi PNGs in 48x48/apps ==="
+          echo "=== Verification: 48x48/apps ==="
           ls 48x48/apps/ | wc -l
 
       - name: Merge Papirus under Tulasi
         run: |
           cd build
 
-          echo "=== Copying Papirus as the base layer ==="
-          # Copy Papirus's main theme into build/
-          # Use /. trick to copy CONTENTS, not the directory itself
-          cp -r ../papirus/Papirus/. .
-          cp -r ../papirus/Papirus-Dark/. Papirus-Dark/ 2>/dev/null || true
-          cp -r ../papirus/Papirus-Light/. Papirus-Light/ 2>/dev/null || true
-
-          echo "=== Overlaying Tulasi PNGs on top (Tulasi wins) ==="
-          # For each size, copy Tulasi's apps/ contents ON TOP of Papirus's apps/.
-          # cp -f forces overwrite, so Tulasi's files replace any Papirus file
-          # with the same name. Anything Tulasi doesn't have, Papirus's version stays.
-          for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
-            if [ -d "$size/apps" ]; then
-              # Count before
-              before=$(find "$size/apps" -type f -o -type l | wc -l)
-              # Copy Tulasi files over the top with -f to force overwrite
-              cp -rf "$size/apps/." "$size/apps/"
-              after=$(find "$size/apps" -type f -o -type l | wc -l)
-              echo "  $size/apps: $before -> $after files (Tulasi overlay applied)"
-            fi
-          done
-
-          # If Tulasi has a scalable/ folder, overlay it too
-          # (Papirus doesn't use scalable/ by default, but just in case)
-          if [ -d scalable ]; then
-            for sub in scalable/*/; do
-              [ -d "$sub" ] || continue
-              cp -rf "$sub." "$sub"
-              echo "  $sub: Tulasi overlay applied"
-            done
+          echo "=== Copying Papirus as base layer (Tulasi wins on collisions) ==="
+          # --ignore-existing: solo copia archivos que NO existan ya en build/.
+          # Tulasi ya generó sus PNGs, así que sobreviven intactos.
+          rsync -a --ignore-existing ../papirus/Papirus/ .
+          if [ -d ../papirus/Papirus-Dark ]; then
+              mkdir -p Papirus-Dark
+              rsync -a --ignore-existing ../papirus/Papirus-Dark/ Papirus-Dark/
+          fi
+          if [ -d ../papirus/Papirus-Light ]; then
+              mkdir -p Papirus-Light
+              rsync -a --ignore-existing ../papirus/Papirus-Light/ Papirus-Light/
           fi
 
       - name: Generate merged index.theme
         run: |
           cd build
 
-          # Discover every directory in the merged theme
           echo "=== Discovered directories in merged theme ==="
           ALL_DIRS=""
-          for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
-            for ctx in apps actions devices mimetypes places status categories emblems emotes panel; do
-              if [ -d "$size/$ctx" ]; then
-                ALL_DIRS="$ALL_DIRS,$size/$ctx"
-                count=$(ls "$size/$ctx" 2>/dev/null | wc -l)
-                echo "  $size/$ctx: $count files"
-              fi
-            done
-          done
-
-          # @2x scaled directories (Papirus convention for HiDPI)
-          for size in 16x16 22x22 24x24 32x32 48x48 64x64; do
-            if [ -d "${size}@2x" ]; then
-              for ctx in apps actions devices mimetypes places status categories; do
-                if [ -d "${size}@2x/$ctx" ]; then
-                  ALL_DIRS="$ALL_DIRS,${size}@2x/$ctx"
-                fi
+          # Iterar TODAS las densidades reales del árbol mergeado
+          for d in $(find . -maxdepth 1 -type d | sed 's|^\./||' | grep -E '^[0-9]+x[0-9]+(@[0-9]+x?)?$' | sort -V); do
+              for ctx in apps actions devices mimetypes places status categories emblems emotes panel legacy ui; do
+                  if [ -d "$d/$ctx" ]; then
+                      ALL_DIRS="$ALL_DIRS,$d/$ctx"
+                      count=$(ls "$d/$ctx" 2>/dev/null | wc -l)
+                      echo "  $d/$ctx: $count files"
+                  fi
               done
-            fi
           done
-
-          # Non-standard sizes (Papirus uses 8x8, 18x18, 22x22, 42x42, 84x84, 96x96)
-          for size in 8x8 18x18 22x22 42x42 84x84 96x96; do
-            for ctx in apps actions devices mimetypes places status emblems; do
-              if [ -d "$size/$ctx" ]; then
-                ALL_DIRS="$ALL_DIRS,$size/$ctx"
-              fi
-            done
-          done
-
-          # Strip leading comma
+          if [ -d scalable ]; then
+              for ctx in actions apps categories devices emblems emotes mimetypes places status legacy ui; do
+                  if [ -d "scalable/$ctx" ]; then
+                      ALL_DIRS="$ALL_DIRS,scalable/$ctx"
+                  fi
+              done
+          fi
           ALL_DIRS="${ALL_DIRS#,}"
 
-          # Write the merged index.theme
           cat > index.theme <<HEADER
           [Icon Theme]
           Name=Tulasi
@@ -393,41 +418,28 @@ jobs:
           Inherits=hicolor
           FollowsColorScheme=true
 
-          DesktopDefault=48
-          DesktopSizes=16,22,24,32,48,64
-          ToolbarDefault=22
-          ToolbarSizes=16,22,24,32,48
-          MainToolbarDefault=22
-          MainToolbarSizes=16,22,24,32,48
-          SmallDefault=16
-          SmallSizes=16,22,24,32,48
-          PanelDefault=48
-          PanelSizes=16,22,24,32,48,64
-          DialogDefault=48
-          DialogSizes=16,22,24,32,48,64
-
           Directories=${ALL_DIRS}
           HEADER
-
-          echo ""
-          echo "=== Generated index.theme header ==="
-          head -20 index.theme
 
       - name: Append per-directory sections to index.theme
         run: |
           cd build
-          # For each directory in Directories, append a [section] with Size, Type, Context
-          # This is what icon loaders actually need to do proper lookups
           for dir in $(grep "^Directories=" index.theme | sed 's/Directories=//' | tr ',' ' '); do
-            # Extract size (e.g., 48 from 48x48/apps) and context (e.g., apps)
             size_part=$(echo "$dir" | cut -d'/' -f1)
             ctx_part=$(echo "$dir" | cut -d'/' -f2)
 
-            # Numeric size: 48x48 -> 48, 16x16@2x -> 16 (nominal, not actual)
-            if [[ "$size_part" == *"@"* ]]; then
+            if [[ "$size_part" == "scalable" ]]; then
+              cat >> index.theme <<SECTION
+
+          [$dir]
+          Size=256
+          Type=Scalable
+          MinSize=16
+          MaxSize=512
+          Context=${ctx_part^}
+          SECTION
+            elif [[ "$size_part" == *"@"* ]]; then
               nominal=$(echo "$size_part" | sed -E 's/([0-9]+)x[0-9]+@.*/\1/')
-              actual=$(echo "$size_part" | sed -E 's/.*@([0-9]+)x?/\1/')
-              # Convert to integer for the @2x scale
               scale=$(echo "$size_part" | sed -E 's/.*@([0-9]+)x?/\1/')
               cat >> index.theme <<SECTION
 
@@ -451,21 +463,12 @@ jobs:
             fi
           done
 
-          echo "=== Final index.theme ==="
-          cat index.theme
-
       - name: Final cleanup
         run: |
           cd build
-          # Strip Papirus's own index.theme (we have our own merged one)
           find . -name 'index.theme' ! -path './index.theme' -delete 2>/dev/null || true
-          # Strip any leftover Papirus cache files
           find . -name 'icon-theme.cache' -delete 2>/dev/null || true
-          # Remove the empty awd file from the original Tulasi repo
-          rm -f awd
-          # Remove our own build scripts
-          rm -f scale.sh
-          # Remove the cow source folder (not needed in the shipped theme)
+          rm -f awd scale.sh .base_sizes
           rm -rf cow
 
       - name: Get version string
@@ -477,23 +480,13 @@ jobs:
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
             echo "version=dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
-          echo "Build version: ${{ steps.version.outputs.version }}"
 
-      - name: Package theme (single zip, no double-wrap)
+      - name: Package theme
         run: |
           cd build
-          # Rename the build dir to Tulasi for the final shipped name
           cd ..
           mv build Tulasi
-
-          # Create the zip directly (no nested directory inside)
           zip -r "Tulasi-${{ steps.version.outputs.version }}.zip" Tulasi
-
-          echo ""
-          echo "=== Zip contents (first 20) ==="
-          unzip -l "Tulasi-${{ steps.version.outputs.version }}.zip" | head -25
-          echo ""
-          echo "=== Total entries ==="
           unzip -l "Tulasi-${{ steps.version.outputs.version }}.zip" | tail -3
 
       - name: Upload build artifact
@@ -514,9 +507,7 @@ jobs:
     steps:
       - name: Resolve version from tag
         id: version
-        run: |
-          VERSION="${GITHUB_REF_NAME}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        run: echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -532,14 +523,11 @@ jobs:
           body: |
             ## Tulasi + Papirus merged icon theme
 
-            Pixel-art Tulasi icons for 100+ apps, layered on top of the latest Papirus
-            for full coverage of everything else.
+            Pixel-art Tulasi icons layered on top of the latest Papirus for full coverage.
 
             **Install:**
             ```bash
             unzip Tulasi-${{ steps.version.outputs.version }}.zip
+            rm -rf ~/.local/share/icons/Tulasi
             mv Tulasi ~/.local/share/icons/Tulasi
-            gtk-update-icon-cache -f -t ~/.local/share/icons/Tulasi
             rm -f ~/.cache/icon-cache.kcache
-            kquitapp6 plasmashell && kstart plasmashell  # KDE only
-            ```
