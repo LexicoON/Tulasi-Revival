@@ -73,7 +73,6 @@ jobs:
 
           cd "$THEME_DIR" || exit 1
 
-          # --- Density list ---
           if [ -s "$THEME_DIR/.base_sizes" ]; then
               SIZES=()
               while IFS= read -r line; do
@@ -91,14 +90,6 @@ jobs:
           fi
           if ! command -v rsvg-convert &> /dev/null; then
               echo "Error: rsvg-convert is not installed!"
-              exit 1
-          fi
-          if command -v magick &> /dev/null; then
-              IMG_CMD="magick"
-          elif command -v convert &> /dev/null; then
-              IMG_CMD="convert"
-          else
-              echo "Error: ImageMagick is not installed!"
               exit 1
           fi
 
@@ -124,29 +115,22 @@ jobs:
               mkdir -p "$size/apps" "$size/places"
           done
 
-          echo "=== 2. Rendering cow/ SVGs at every density ==="
+          echo "=== 2. Rendering cow/ SVGs directly at each density (crisp) ==="
           master_count=0
           for master in "$COW_DIR"/*.svg; do
               [ -f "$master" ] || continue
               [ ! -L "$master" ] || continue
               base_name=$(basename "$master" .svg)
               png_filename="${base_name}.png"
-              tmp_master="/tmp/${base_name}_temp.png"
               ctx=$(detect_ctx "$base_name")
               echo "  -> $base_name  [$ctx]"
-              rsvg-convert -w 512 -h 512 "$master" -o "$tmp_master"
               for size in "${SIZES[@]}"; do
                   dim=$(target_dim "$size")
                   target_dir="$size/$ctx"
                   target_file="$target_dir/$png_filename"
                   mkdir -p "$target_dir"
-                  if [ "$dim" -eq 512 ]; then
-                      cp "$tmp_master" "$target_file"
-                  else
-                      $IMG_CMD -background none "$tmp_master" -scale "${dim}x${dim}!" "$target_file"
-                  fi
+                  rsvg-convert -w "$dim" -h "$dim" "$master" -o "$target_file"
               done
-              rm -f "$tmp_master"
               master_count=$((master_count + 1))
           done
           echo "=== Processed $master_count source SVGs ==="
@@ -321,7 +305,7 @@ jobs:
               done
           done
 
-          echo "=== 4. Rendering scalable/* SVGs to PNGs ==="
+          echo "=== 4. Rendering scalable/* SVGs directly at each density ==="
           if [ -d "$THEME_DIR/scalable" ]; then
               for ctx_dir in "$THEME_DIR"/scalable/*/; do
                   [ -d "$ctx_dir" ] || continue
@@ -332,20 +316,13 @@ jobs:
                   for svg in "$ctx_dir"*.svg; do
                       [ -f "$svg" ] || continue
                       base_name=$(basename "$svg" .svg)
-                      tmp_master="/tmp/scalable_${ctx}_${base_name}.png"
-                      rsvg-convert -w 512 -h 512 "$svg" -o "$tmp_master"
                       for size in "${SIZES[@]}"; do
                           dim=$(target_dim "$size")
                           target_dir="$size/$ctx"
                           target_file="$target_dir/$base_name.png"
                           mkdir -p "$target_dir"
-                          if [ "$dim" -eq 512 ]; then
-                              cp "$tmp_master" "$target_file"
-                          else
-                              $IMG_CMD -background none "$tmp_master" -scale "${dim}x${dim}!" "$target_file"
-                          fi
+                          rsvg-convert -w "$dim" -h "$dim" "$svg" -o "$target_file"
                       done
-                      rm -f "$tmp_master"
                   done
               done
           fi
@@ -373,9 +350,25 @@ jobs:
         run: |
           cd build
 
+          echo "=== Extracting Papirus alias graph (symlinks) ==="
+          # Papirus usa symlinks para crear cientos de aliases.
+          # Los registramos ANTES del merge para poder re-expandirlos
+          # con el contenido de Tulasi después.
+          ALIAS_GRAPH=/tmp/papirus_aliases.txt
+          : > "$ALIAS_GRAPH"
+          for size_dir in ../papirus/Papirus/*/; do
+              [ -d "$size_dir/apps" ] || continue
+              size=$(basename "$size_dir")
+              for f in "$size_dir"/apps/*.png; do
+                  [ -L "$f" ] || continue
+                  alias_name=$(basename "$f")
+                  target_name=$(basename "$(readlink "$f")")
+                  echo "$size/$alias_name:$target_name" >> "$ALIAS_GRAPH"
+              done
+          done
+          echo "Recorded $(wc -l < $ALIAS_GRAPH) alias relationships"
+
           echo "=== Copying Papirus as base layer (Tulasi wins on collisions) ==="
-          # --ignore-existing: solo copia archivos que NO existan ya en build/.
-          # Tulasi ya generó sus PNGs, así que sobreviven intactos.
           rsync -a --ignore-existing ../papirus/Papirus/ .
           if [ -d ../papirus/Papirus-Dark ]; then
               mkdir -p Papirus-Dark
@@ -386,13 +379,25 @@ jobs:
               rsync -a --ignore-existing ../papirus/Papirus-Light/ Papirus-Light/
           fi
 
+          echo "=== Expanding Papirus aliases using Tulasi content ==="
+          # Para cada symlink A -> T de Papirus, hacemos build/A = build/T.
+          # Si build/T ya es la versión de Tulasi (porque Tulasi tenía ese
+          # nombre), A ahora mostrará el icono de Tulasi.
+          while IFS=: read -r alias_path target_name; do
+              size=$(dirname "$alias_path")
+              alias_name=$(basename "$alias_path")
+              if [ -f "$size/apps/$target_name" ]; then
+                  cp -f "$size/apps/$target_name" "$size/apps/$alias_name"
+              fi
+          done < "$ALIAS_GRAPH"
+          echo "Done. Aliases expanded."
+
       - name: Generate merged index.theme
         run: |
           cd build
 
           echo "=== Discovered directories in merged theme ==="
           ALL_DIRS=""
-          # Iterar TODAS las densidades reales del árbol mergeado
           for d in $(find . -maxdepth 1 -type d | sed 's|^\./||' | grep -E '^[0-9]+x[0-9]+(@[0-9]+x?)?$' | sort -V); do
               for ctx in apps actions devices mimetypes places status categories emblems emotes panel legacy ui; do
                   if [ -d "$d/$ctx" ]; then
